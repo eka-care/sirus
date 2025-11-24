@@ -17,13 +17,16 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
+import io
+import jwt
 import logging
-from typing import Any, TYPE_CHECKING
-
-from flask import current_app as app, g, make_response, request, Response
+import requests
+from flask import current_app, g, make_response, request, Response, render_template
 from flask_appbuilder.api import expose, protect
 from flask_babel import gettext as _
 from marshmallow import ValidationError
+from typing import Any, TYPE_CHECKING, Tuple
 
 from superset import is_feature_enabled, security_manager
 from superset.async_events.async_query_manager import AsyncQueryTokenException
@@ -174,7 +177,7 @@ class ChartDataRestApi(ChartRestApi):
             form_data = {}
 
         return self._get_data_response(
-            command=command, form_data=form_data, datasource=query_context.datasource
+            command=command, form_data=form_data, datasource=query_context.datasource, oid=''
         )
 
     @expose("/data", methods=("POST",))
@@ -224,6 +227,25 @@ class ChartDataRestApi(ChartRestApi):
               $ref: '#/components/responses/500'
         """
         json_body = None
+
+        oid = ''
+        bid = ''
+        try:
+            cookie_header = request.headers.get("Cookie", "")
+            # Parse cookies into a dictionary
+            cookies = {kv.split("=")[0]: "=".join(kv.split("=")[1:]) for kv in
+                       cookie_header.split("; ") if "=" in kv}
+            # Extract the 'sess' value
+            sess_token = cookies.get("sess", None)
+            decoded = jwt.decode(sess_token, options={"verify_signature": False})
+            oid = decoded.get('oid')
+            bid = decoded.get('b-id',"") or decoded.get('w-id')
+        except Exception as e:
+            #print("=====exception===", str(e))
+            logger.error(f"=====exception==={e}")
+        # print("=====INSIDE FUNC=1=====", str(datetime.datetime.now()))
+
+
         if request.is_json:
             json_body = request.json
         elif request.form.get("form_data"):
@@ -235,6 +257,12 @@ class ChartDataRestApi(ChartRestApi):
 
         try:
             query_context = self._create_query_context_from_form(json_body)
+            try:
+                if query_context.result_format in ChartDataResultFormat.table_like():
+                    #print("=====INSIDE FUNC=2=====", str(datetime.datetime.now()))
+                    logger.info(f"=====INSIDE FUNC=2==={datetime.datetime.now()}==")
+            except Exception as e:
+                print("====INSIDE FUNC=2=exception===", str(e))
             command = ChartDataCommand(query_context)
             command.validate()
         except DatasourceNotFound:
@@ -248,18 +276,89 @@ class ChartDataRestApi(ChartRestApi):
                 )
             )
 
+        if query_context.result_format in ChartDataResultFormat.table_like():
+            logger.info(f"=====INSIDE FUNC=3==={datetime.datetime.now()}==")
+
         # TODO: support CSV, SQL query and other non-JSON types
+        # Always run async for download cases
         if (
             is_feature_enabled("GLOBAL_ASYNC_QUERIES")
             and query_context.result_format == ChartDataResultFormat.JSON
             and query_context.result_type == ChartDataResultType.FULL
         ):
+            logger.info("======running async======")
             return self._run_async(json_body, command)
 
         form_data = json_body.get("form_data")
+
+        if query_context.result_format in ChartDataResultFormat.download_like():
+            # Eka special Async Download case
+            # BnB API Call
+            datasource = query_context.form_data.get('datasource')
+            if datasource and datasource.split("__")[0]:
+                slice_id = query_context.form_data.get('slice_id', '')
+                dashboard_id = query_context.form_data.get('dashboardId', '')
+                dataset_id = int(datasource.split("__")[0])
+                # Call BNB API to Download
+
+                url_params = form_data.get("url_params", {})
+                start = url_params.get("start", "")
+                end = url_params.get("end", "")
+                oid = url_params.get("end", "")
+                bid = url_params.get('b-id',"") or url_params.get('w-id')
+
+                resp_json, status = self.start_async_download(dataset_id, slice_id, oid, bid, start, end)
+                logger.info(f"=====response from self.start_async_download==={resp_json}===")
+
+                if status:
+                    html_content = render_template('superset/status_loader.html',
+                                                   task_id=resp_json['task_id'],
+                                                   email=resp_json['email'])
+                    return Response(html_content, status=200, mimetype='text/html')
+                    #return self.response(202, **resp_json)
+                else:
+                    # Should mean API has failed - that's how bnb async download API is written
+                    err = resp_json.get("error", "Unknown Error")
+                    return self.response(400, message=err)
+
         return self._get_data_response(
             command, form_data=form_data, datasource=query_context.datasource
         )
+
+    def start_async_download(self, dataset_id, slice_id,oid, bid, start, end)  -> \
+        tuple[Any, bool]:
+        # {
+        #     "dataset_id": "164",
+        #     "slice_id": "3218",
+        #     "user_sk": "50966",
+        #     "oid": "161467756044203"
+        # }
+        url = "http://bnb.orbi.orbi/api/download_analytics/"
+        payload = json.dumps({
+            "dataset_id": dataset_id,
+            "slice_id": slice_id,
+            "user_sk": "",
+            "business_sk": "",
+            "dashboard_id": dashboard_id,
+            "oid": oid,
+            "bid": bid,
+            "start": start,
+            "end": end
+        })
+        headers = {
+            'accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        response = requests.post(url, headers=headers, data=payload)
+        logger.info(f"=====response from BNB API==={response.text}===")
+
+        if str(response.status_code).startswith("2"):
+            return response.json(), True
+        else:
+            logger.error(f"Error calling Async Download API: {response.text}")
+            return response.json(), False
+
+
 
     @expose("/data/<cache_key>", methods=("GET",))
     @protect()
@@ -327,8 +426,10 @@ class ChartDataRestApi(ChartRestApi):
         """
         # First, look for the chart query results in the cache.
         with contextlib.suppress(ChartDataCacheLoadError):
+            logger.info(f"======result_format command.run return===={datetime.datetime.now()}")
             result = command.run(force_cached=True)
             if result is not None:
+                logger.info(f"======result_format result is not None===={datetime.datetime.now()}")
                 return self._send_chart_response(result)
         # Otherwise, kick off a background job to run the chart query.
         # Clients will either poll or be notified of query completion,
@@ -340,18 +441,28 @@ class ChartDataRestApi(ChartRestApi):
         except AsyncQueryTokenException:
             return self.response_401()
 
+        logger.info(f"======result_format before async_command.run===={datetime.datetime.now()}")
         result = async_command.run(form_data, get_user_id())
+        logger.info(f"======result_format after async_command.run===={datetime.datetime.now()}")
         return self.response(202, **result)
+
+        def upload(self, data, headers):
+            bucket_name = 'm-prod-superset-download'
+        s3_file_name = headers.get("Content-Disposition")
+        return self.generate_s3_response(data, headers, bucket_name, s3_file_name)
+
 
     def _send_chart_response(  # noqa: C901
         self,
         result: dict[Any, Any],
         form_data: dict[str, Any] | None = None,
         datasource: BaseDatasource | Query | None = None,
+        oid: str = "",
     ) -> Response:
         result_type = result["query_context"].result_type
         result_format = result["query_context"].result_format
 
+        logger.info(f"======result_format==={result_format}=={datetime.datetime.now()}")
         # Post-process the data so it matches the data presented in the chart.
         # This is needed for sending reports based on text charts that do the
         # post-processing of data, eg, the pivot table.
@@ -371,10 +482,35 @@ class ChartDataRestApi(ChartRestApi):
             if len(result["queries"]) == 1:
                 # return single query results
                 data = result["queries"][0]["data"]
-                if is_csv_format:
-                    return CsvResponse(data, headers=generate_download_headers("csv"))
-
-                return XlsxResponse(data, headers=generate_download_headers("xlsx"))
+                data_size = len(data.encode('utf-8')) if isinstance(data, str) else len(
+                    data)
+                if data_size > 10 * 1024 * 1024:  # 10 MB
+                    if is_csv_format:
+                        format = "csv"
+                    else:
+                        format = "xlsx"
+                    #print("=======format1=======", format, str(datetime.datetime.now()))
+                    logger.info(f"=======format1===={format}==={datetime.datetime.now()}")
+                    if is_csv_format:
+                        if isinstance(data, str):  # Convert string to bytes only if needed
+                            file_data = io.BytesIO(data.encode('utf-8'))
+                        else:
+                            file_data = io.BytesIO(data)  # If already bytes, use as is
+                    else:
+                        if isinstance(data, str):
+                            file_data = io.BytesIO(data.encode("utf-8"))  # Convert string to bytes
+                        else:
+                            file_data = io.BytesIO(data)  # Wrap bytes in BytesIO
+                        #file_data = io.BytesIO(data)
+                    logger.info(f"=======format2==={format}===={datetime.datetime.now()}")
+                    headers = generate_download_headers(format)
+                    logger.info(f"=======format3==={format}===={datetime.datetime.now()}")
+                    return self.upload(file_data, headers)
+                else:
+                    if is_csv_format:
+                        return CsvResponse(data, headers=generate_download_headers("csv"))
+                    else:
+                        return XlsxResponse(data, headers=generate_download_headers("xlsx"))
 
             # return multi-query results bundled as a zip file
             def _process_data(query_data: Any) -> Any:
@@ -417,6 +553,7 @@ class ChartDataRestApi(ChartRestApi):
         force_cached: bool = False,
         form_data: dict[str, Any] | None = None,
         datasource: BaseDatasource | Query | None = None,
+        oid: str = "",
     ) -> Response:
         try:
             result = command.run(force_cached=force_cached)
@@ -425,7 +562,7 @@ class ChartDataRestApi(ChartRestApi):
         except ChartDataQueryFailedError as exc:
             return self.response_400(message=exc.message)
 
-        return self._send_chart_response(result, form_data, datasource)
+        return self._send_chart_response(result, form_data, datasource, oid)
 
     # pylint: disable=invalid-name
     def _load_query_context_form_from_cache(self, cache_key: str) -> dict[str, Any]:
